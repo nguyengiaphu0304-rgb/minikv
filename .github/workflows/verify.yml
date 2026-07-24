@@ -40,6 +40,10 @@ jobs:
         run: mypy src scripts
       - name: Tests
         run: pytest
+      - name: Reproducible release demo
+        run: |
+          python scripts/demo.py --output demo-output
+          python scripts/demo.py --verify demo-output
       - name: Deterministic workload evidence
         run: |
           python scripts/workload_evidence.py \
@@ -53,7 +57,38 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Build package
-        run: python -m build
+        env:
+          SOURCE_DATE_EPOCH: "946684800"
+        run: |
+          mkdir dist-first dist-second dist
+          python -m build --outdir dist-first
+          python -m build --outdir dist-second
+          gzip -cd dist-first/minikv_store-1.0.0.tar.gz |
+            gzip -n -9 > dist-first/minikv_store-1.0.0.normalized.tar.gz
+          mv dist-first/minikv_store-1.0.0.normalized.tar.gz \
+            dist-first/minikv_store-1.0.0.tar.gz
+          gzip -cd dist-second/minikv_store-1.0.0.tar.gz |
+            gzip -n -9 > dist-second/minikv_store-1.0.0.normalized.tar.gz
+          mv dist-second/minikv_store-1.0.0.normalized.tar.gz \
+            dist-second/minikv_store-1.0.0.tar.gz
+          cmp dist-first/minikv_store-1.0.0-py3-none-any.whl \
+            dist-second/minikv_store-1.0.0-py3-none-any.whl
+          cmp dist-first/minikv_store-1.0.0.tar.gz \
+            dist-second/minikv_store-1.0.0.tar.gz
+          cp dist-first/* dist/
+          python scripts/verify_release.py --dist dist --write-checksums
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: minikv-v1.0.0-python-${{ matrix.python-version }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            demo-output/manifest.json
+            demo-output/summary.md
+          if-no-files-found: error
+          retention-days: 14
       - name: Dependency consistency
         run: python -m pip check
       - name: Vulnerability audit
