@@ -5,7 +5,7 @@ and portfolio review. It demonstrates how an append-only log can acknowledge
 mutations only after durability, rebuild deterministic state after restart, and
 distinguish a torn final write from complete corrupt data.
 
-The current `v0.3` engine is intentionally single-process and local. It is
+The current `v0.4` engine is intentionally single-writer and local. It is
 not a replacement for SQLite, RocksDB, Redis, or a production database.
 
 ## What it does
@@ -20,6 +20,8 @@ not a replacement for SQLite, RocksDB, Redis, or a production database.
   frames fail closed without modifying the file.
 - Enforces key, value, database, and declared-frame limits before allocation.
 - Rejects symbolic links and non-regular database paths.
+- Acquires a non-blocking POSIX lifetime lock before opening a database and
+  rejects concurrent cooperating processes with `ConcurrencyError`.
 - Compacts live state into deterministic sorted frames using a private sibling
   file, independent validation, atomic replacement, and parent-directory
   `fsync` where supported.
@@ -114,11 +116,27 @@ temporary file. The extracted payload must pass the ordinary MiniKV scanner and
 reconstruct a complete canonical log. Existing destinations require
 `overwrite=True`. Every handled pre-replacement failure preserves the previous
 destination; a post-replacement failure reports uncertainty and requires reopen.
+Restore owns the destination's lifetime lock from before inspection through the
+replacement and directory-durability boundary.
 
 SHA-256 detects accidental modification but is not a publisher signature.
 Retention, access control, encryption, and remote durability remain deployment
-responsibilities. Restore targets must be inactive because MiniKV does not yet
-coordinate concurrent processes.
+responsibilities.
+
+## Concurrency contract
+
+`MiniKV.open()` creates or reuses a persistent owner-only
+`.DATABASE_NAME.lock` sibling and acquires a non-blocking exclusive POSIX
+`flock` before it opens, creates, scans, or repairs the database. The lock is
+held across mutations, compaction, and backup until `close()`. Restore acquires
+the same destination lock for its full operation. A clean close or process exit,
+including abrupt exit, releases the kernel lock.
+
+The sidecar is deliberately not unlinked on close: unlinking could let a second
+process lock a new inode while an existing process still owns the old one.
+MiniKV rechecks both database and lock-file identities before mutations and
+replacement boundaries. This is an advisory protocol for cooperating MiniKV
+processes, not protection from software that ignores the lock.
 
 ## Design documentation
 
@@ -130,10 +148,13 @@ coordinate concurrent processes.
 - [ADR-001: append-only verified log](docs/adr/001-append-only-verified-log.md)
 - [ADR-002: validated atomic compaction](docs/adr/002-validated-atomic-compaction.md)
 - [ADR-003: canonical backup and atomic restore](docs/adr/003-canonical-backup-restore.md)
+- [ADR-004: POSIX lifetime lock](docs/adr/004-posix-lifetime-lock.md)
 
 ## Current limitations
 
-- One process and one open writer only; there is no file locking.
+- One open writer per database is enforced only for cooperating processes on
+  POSIX filesystems with reliable `flock` semantics. Windows is not supported
+  by this milestone.
 - No transactions across multiple keys, compare-and-swap, snapshots, or
   isolation levels.
 - No encryption, authenticated writer, artifact signing, remote retention
@@ -144,7 +165,9 @@ coordinate concurrent processes.
   power-loss or filesystem-failure testing.
 - `fsync` semantics still depend on the operating system, filesystem, and
   storage device.
+- Advisory locks do not stop malicious or non-cooperating writers. Network and
+  distributed filesystems may not provide the local lock semantics MiniKV
+  assumes; inherited handles after `fork()` are unsupported.
 
-The next milestone adds explicit concurrent-open handling, followed by
-repeatable performance/data-quality evidence before a `v1.0` release is
-considered.
+The next milestone adds repeatable performance/data-quality evidence and
+privacy-safe operational events before a `v1.0` release is considered.

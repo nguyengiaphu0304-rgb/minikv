@@ -5,8 +5,9 @@ persistence mechanism.
 
 ## Components
 
-1. `MiniKV.open` validates the target, opens it without following a
-   final-component symlink, and bounds the file before scanning.
+1. `MiniKV.open` acquires a non-blocking exclusive POSIX lifetime lock, validates
+   the target, opens it without following a final-component symlink, and bounds
+   the file before scanning.
 2. The scanner validates each binary frame and rebuilds an in-memory dictionary.
 3. The mutation path serializes one complete frame, appends it, flushes and
    `fsync`s it, and only then changes visible state.
@@ -18,15 +19,15 @@ persistence mechanism.
    durability, and rebinds the active handle.
 7. Backup wraps the same canonical log in a strict `MKB1` envelope, then
    independently verifies and atomically publishes the artifact.
-8. Restore validates the envelope and SHA-256 before writing, runs the extracted
+8. Restore locks the destination, validates the envelope and SHA-256 before writing, runs the extracted
    payload through the ordinary startup scanner, checks canonical equality, and
-   atomically replaces only an inactive destination.
+   atomically replaces only a destination it exclusively coordinates.
 
 ```text
 caller
   |
   v
-public validation -> frame encoder -> append / flush / fsync
+lifetime lock -> public validation -> frame encoder -> append / flush / fsync
   |                                      |
   |                                      v
   +------------------------------> append-only file
@@ -59,11 +60,16 @@ public validation -> frame encoder -> append / flush / fsync
 - Restore never treats an envelope digest as sufficient validation. The payload
   must satisfy the binary log, entry-count, completeness, and canonical-order
   contracts before the destination can change.
+- The lock is acquired before database inspection and held until close. The
+  persistent sidecar preserves a stable lock inode across clean close and crash.
+  Database and lock identities are checked before every mutation and destructive
+  replacement boundary.
 
 ## Deliberate scope
 
 The engine optimizes for a readable storage contract, deterministic tests, and
-explicit failure behavior. It does not claim multi-process coordination,
+explicit failure behavior. It coordinates one writer among cooperating POSIX
+processes, but does not claim malicious-writer exclusion, distributed locking,
 remote backup durability, or database-grade transactional guarantees. Backup
 artifacts provide portable recovery evidence, not retention policy, encryption,
 or authenticated provenance.

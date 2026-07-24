@@ -68,3 +68,11 @@ bounded by the configured database limit plus the fixed header.
 SHA-256 provides corruption evidence and deterministic lineage. It does not
 authenticate who created the backup; a malicious writer can replace both
 payload and digest.
+
+## Lock sidecar
+
+The `.DATABASE_NAME.lock` sibling is coordination metadata, not part of the
+binary database or backup format. It contains no keys, values, identifiers, or
+authoritative state. Its inode is the POSIX advisory-lock rendezvous point, so
+it persists after close and must not be copied as database content or deleted
+while any process may use the database.

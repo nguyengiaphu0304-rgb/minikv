@@ -10,10 +10,17 @@ import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
+from importlib import import_module
 from pathlib import Path
 from typing import BinaryIO, Final, NoReturn, Self
 
-from minikv.errors import ClosedError, CorruptionError, LimitError, PersistenceError
+from minikv.errors import (
+    ClosedError,
+    ConcurrencyError,
+    CorruptionError,
+    LimitError,
+    PersistenceError,
+)
 
 MAGIC: Final = b"MKV1"
 FORMAT_VERSION: Final = 1
@@ -86,8 +93,21 @@ class _FrameHeader:
     value_length: int
 
 
+@dataclass(frozen=True, slots=True)
+class _LifetimeLock:
+    path: Path
+    file: BinaryIO
+    identity: tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _StoreOptions:
+    max_database_bytes: int
+    fault_hook: FaultHook | None
+
+
 class MiniKV:
-    """A single-process append-only key-value store.
+    """A single-writer append-only key-value store.
 
     Mutations are acknowledged only after the frame has been flushed and fsynced.
     Opening a log rebuilds the in-memory index and may truncate one incomplete final
@@ -98,17 +118,19 @@ class MiniKV:
         self,
         path: Path,
         file: BinaryIO,
-        *,
-        max_database_bytes: int,
-        fault_hook: FaultHook | None,
+        lock: _LifetimeLock | None,
+        options: _StoreOptions,
     ) -> None:
         """Build an index from an already validated and opened file."""
         self._path = path
         self._file = file
         self._file_identity = self._identity(os.fstat(file.fileno()))
         self._parent_identity = self._identity(path.parent.stat())
-        self._max_database_bytes = max_database_bytes
-        self._fault_hook = fault_hook
+        self._lock_path = None if lock is None else lock.path
+        self._lock_file = None if lock is None else lock.file
+        self._lock_identity = None if lock is None else lock.identity
+        self._max_database_bytes = options.max_database_bytes
+        self._fault_hook = options.fault_hook
         self._index: dict[str, bytes] = {}
         self._sequence = 0
         self._log_bytes = 0
@@ -132,29 +154,133 @@ class MiniKV:
         if not 1 <= max_database_bytes <= HARD_MAX_DATABASE_BYTES:
             msg = f"max_database_bytes must be between 1 and {HARD_MAX_DATABASE_BYTES}"
             raise LimitError(msg)
+        lock = cls._acquire_lifetime_lock(database)
         try:
-            mode = database.lstat().st_mode
-        except FileNotFoundError:
-            pass
-        else:
-            if stat.S_ISLNK(mode):
-                msg = "database path must not be a symbolic link"
-                raise ValueError(msg)
-            if not stat.S_ISREG(mode):
-                msg = "database path must be a regular file"
-                raise ValueError(msg)
+            try:
+                mode = database.lstat().st_mode
+            except FileNotFoundError:
+                pass
+            else:
+                if stat.S_ISLNK(mode):
+                    msg = "database path must not be a symbolic link"
+                    raise ValueError(msg)
+                if not stat.S_ISREG(mode):
+                    msg = "database path must be a regular file"
+                    raise ValueError(msg)
 
+            flags = os.O_RDWR | os.O_CREAT
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(database, flags, 0o600)
+            file = os.fdopen(descriptor, "r+b", buffering=0)
+            try:
+                return cls(
+                    database,
+                    file,
+                    lock,
+                    _StoreOptions(max_database_bytes, fault_hook),
+                )
+            except Exception:
+                file.close()
+                raise
+        except Exception:
+            lock.file.close()
+            raise
+
+    @staticmethod
+    def _lock_path_for(database: Path) -> Path:
+        return database.with_name(f".{database.name}.lock")
+
+    @staticmethod
+    def _validate_lock_path(path: Path) -> None:
+        try:
+            metadata = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(metadata.st_mode):
+            msg = "database lock path must not be a symbolic link"
+            raise ValueError(msg)
+        if not stat.S_ISREG(metadata.st_mode):
+            msg = "database lock path must be a regular file"
+            raise ValueError(msg)
+
+    @classmethod
+    def _assert_lock_path_identity(
+        cls,
+        path: Path,
+        expected: tuple[int, int],
+        *,
+        message: str,
+    ) -> None:
+        if cls._path_identity_or_none(path, label="database lock path") != expected:
+            raise PersistenceError(message)
+
+    @classmethod
+    def _finish_lock_acquisition(cls, path: Path, file: BinaryIO) -> _LifetimeLock:
+        metadata = os.fstat(file.fileno())
+        if not stat.S_ISREG(metadata.st_mode):
+            msg = "database lock path must be a regular file"
+            raise ValueError(msg)
+        os.fchmod(file.fileno(), 0o600)
+        identity = cls._identity(metadata)
+        cls._assert_lock_path_identity(
+            path,
+            identity,
+            message="database lock path was replaced while it was being opened",
+        )
+        fcntl = import_module("fcntl")
+        try:
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            msg = "database is already open in another cooperating process"
+            raise ConcurrencyError(msg) from error
+        cls._assert_lock_path_identity(
+            path,
+            identity,
+            message="database lock path was replaced while it was being acquired",
+        )
+        return _LifetimeLock(path, file, identity)
+
+    @classmethod
+    def _acquire_lifetime_lock(
+        cls,
+        database: Path,
+    ) -> _LifetimeLock:
+        if os.name != "posix":
+            msg = "MiniKV lifetime locking requires POSIX flock support"
+            raise PersistenceError(msg)
+        lock_path = cls._lock_path_for(database)
+        cls._validate_lock_path(lock_path)
         flags = os.O_RDWR | os.O_CREAT
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        descriptor = os.open(database, flags, 0o600)
+        descriptor = os.open(lock_path, flags, 0o600)
+        lock_file = os.fdopen(descriptor, "r+b", buffering=0)
+        try:
+            return cls._finish_lock_acquisition(lock_path, lock_file)
+        except Exception:
+            lock_file.close()
+            raise
+
+    @classmethod
+    def _open_owned_candidate(
+        cls,
+        path: Path,
+        *,
+        max_database_bytes: int,
+    ) -> MiniKV:
+        """Open an exclusively owned temporary file without a sidecar lock."""
+        flags = os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
         file = os.fdopen(descriptor, "r+b", buffering=0)
         try:
             return cls(
-                database,
+                path,
                 file,
-                max_database_bytes=max_database_bytes,
-                fault_hook=fault_hook,
+                None,
+                _StoreOptions(max_database_bytes, None),
             )
         except Exception:
             file.close()
@@ -192,6 +318,14 @@ class MiniKV:
             raise PersistenceError(msg)
         if self._identity(parent_metadata) != self._parent_identity:
             msg = "database parent directory was replaced while the handle was open"
+            raise PersistenceError(msg)
+        if (
+            self._lock_path is not None
+            and self._lock_identity is not None
+            and self._path_identity_or_none(self._lock_path, label="database lock path")
+            != self._lock_identity
+        ):
+            msg = "database lock path was replaced while the handle was open"
             raise PersistenceError(msg)
 
     @staticmethod
@@ -340,6 +474,7 @@ class MiniKV:
         self._write_all_to(self._file, content)
 
     def _append(self, operation: int, key: str, key_bytes: bytes, value: bytes) -> None:
+        self._assert_path_identity()
         sequence = self._sequence + 1
         frame = self._frame(operation, sequence, key_bytes, value)
         if self._log_bytes + len(frame) > self._max_database_bytes:
@@ -440,7 +575,10 @@ class MiniKV:
             path.unlink()
 
     def _validate_compacted_file(self, path: Path, expected_bytes: int) -> None:
-        with MiniKV.open(path, max_database_bytes=self._max_database_bytes) as candidate:
+        with self._open_owned_candidate(
+            path,
+            max_database_bytes=self._max_database_bytes,
+        ) as candidate:
             if candidate.keys() != tuple(sorted(self._index)) or any(
                 candidate.get(key) != value for key, value in self._index.items()
             ):
@@ -697,7 +835,10 @@ class MiniKV:
         expected_bytes: int,
         max_database_bytes: int,
     ) -> None:
-        with MiniKV.open(path, max_database_bytes=max_database_bytes) as candidate:
+        with MiniKV._open_owned_candidate(
+            path,
+            max_database_bytes=max_database_bytes,
+        ) as candidate:
             stats = candidate.stats()
             if stats.entries != expected_entries or stats.sequence != expected_entries:
                 msg = "backup entry count does not match its payload"
@@ -787,9 +928,15 @@ class MiniKV:
         if target == self._path:
             msg = "backup destination must differ from the database path"
             raise ValueError(msg)
+        if target == self._lock_path:
+            msg = "backup destination must differ from the database lock path"
+            raise ValueError(msg)
         target_identity = self._path_identity_or_none(target, label="backup destination")
         if target_identity == self._file_identity:
             msg = "backup destination must not alias the database path"
+            raise ValueError(msg)
+        if target_identity == self._lock_identity:
+            msg = "backup destination must not alias the database lock path"
             raise ValueError(msg)
         parent_identity = self._identity(target.parent.stat())
         payload = self._canonical_log()
@@ -944,60 +1091,69 @@ class MiniKV:
         if source == target:
             msg = "restore destination must differ from the backup path"
             raise ValueError(msg)
-        payload, entries, digest, source_identity = cls._read_backup_artifact(
-            source,
-            max_database_bytes=max_database_bytes,
-        )
-        target_identity = cls._restore_target_identity(
-            target,
-            source_identity=source_identity,
-            overwrite=overwrite,
-        )
-        parent_identity = cls._identity(target.parent.stat())
-        temporary = target.with_name(f".{target.name}.restore.tmp")
-        if temporary.exists() or temporary.is_symlink():
-            msg = "restore temporary path already exists"
-            raise PersistenceError(msg)
-
-        temporary_identity: tuple[int, int] | None = None
-        replaced = False
+        lock = cls._acquire_lifetime_lock(target)
         try:
-            temporary_identity = cls._write_fsynced_temporary(
-                temporary,
-                payload,
-                stage_prefix="restore",
-                fault_hook=fault_hook,
-            )
-            if fault_hook is not None:
-                fault_hook("restore_before_validation")
-            cls._validate_restored_payload(
-                temporary,
-                expected_entries=entries,
-                expected_bytes=len(payload),
+            payload, entries, digest, source_identity = cls._read_backup_artifact(
+                source,
                 max_database_bytes=max_database_bytes,
             )
-            if fault_hook is not None:
-                fault_hook("restore_before_replace")
-            cls._validate_restore_paths(
-                source,
+            target_identity = cls._restore_target_identity(
                 target,
                 source_identity=source_identity,
-                target_identity=target_identity,
-                parent_identity=parent_identity,
+                overwrite=overwrite,
             )
-            temporary.replace(target)
-            replaced = True
-            if fault_hook is not None:
-                fault_hook("restore_after_replace")
-                fault_hook("restore_before_directory_fsync")
-            directory_fsynced = cls._fsync_directory(target.parent)
-        except (CorruptionError, LimitError, OSError, PersistenceError, ValueError) as error:
-            cls._raise_restore_failure(
-                error,
-                replaced=replaced,
-                temporary=temporary,
-                temporary_identity=temporary_identity,
-            )
+            parent_identity = cls._identity(target.parent.stat())
+            temporary = target.with_name(f".{target.name}.restore.tmp")
+            if temporary.exists() or temporary.is_symlink():
+                msg = "restore temporary path already exists"
+                raise PersistenceError(msg)
+
+            temporary_identity: tuple[int, int] | None = None
+            replaced = False
+            try:
+                temporary_identity = cls._write_fsynced_temporary(
+                    temporary,
+                    payload,
+                    stage_prefix="restore",
+                    fault_hook=fault_hook,
+                )
+                if fault_hook is not None:
+                    fault_hook("restore_before_validation")
+                cls._validate_restored_payload(
+                    temporary,
+                    expected_entries=entries,
+                    expected_bytes=len(payload),
+                    max_database_bytes=max_database_bytes,
+                )
+                if fault_hook is not None:
+                    fault_hook("restore_before_replace")
+                cls._validate_restore_paths(
+                    source,
+                    target,
+                    source_identity=source_identity,
+                    target_identity=target_identity,
+                    parent_identity=parent_identity,
+                )
+                cls._assert_lock_path_identity(
+                    lock.path,
+                    lock.identity,
+                    message="database lock path was replaced during restore",
+                )
+                temporary.replace(target)
+                replaced = True
+                if fault_hook is not None:
+                    fault_hook("restore_after_replace")
+                    fault_hook("restore_before_directory_fsync")
+                directory_fsynced = cls._fsync_directory(target.parent)
+            except (CorruptionError, LimitError, OSError, PersistenceError, ValueError) as error:
+                cls._raise_restore_failure(
+                    error,
+                    replaced=replaced,
+                    temporary=temporary,
+                    temporary_identity=temporary_identity,
+                )
+        finally:
+            lock.file.close()
 
         return RestoreStats(
             entries=entries,
@@ -1013,3 +1169,5 @@ class MiniKV:
             return
         self._closed = True
         self._file.close()
+        if self._lock_file is not None:
+            self._lock_file.close()

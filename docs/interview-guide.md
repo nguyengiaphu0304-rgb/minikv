@@ -35,9 +35,26 @@ unconfirmable rollback closes the handle.
 
 ## What would change for multiple writers?
 
-The design needs an explicit lock and lifetime rules, stale-handle behavior, and
-tests across independent processes. Merely relying on append mode would not make
-sequence allocation or index state safe.
+MiniKV deliberately rejects multiple writers. A POSIX lifetime lock is acquired
+before scanning and held until close because each process owns a derived index
+and the next sequence number. Locking only individual appends would allow those
+views to become stale. Supporting concurrent writers would require a different
+coordination and isolation design, not a narrower lock.
+
+## Why keep an empty lock sidecar after close?
+
+The inode is the rendezvous point for `flock`. If a process unlinked it while
+another process still had that inode open, a newcomer could create and lock a
+different inode and both would believe they held the database lock. Persistence
+avoids that split-brain race; the file carries no application data.
+
+## What does the lock not guarantee?
+
+It is advisory and protects only cooperating MiniKV processes on POSIX systems
+with reliable local `flock` semantics. Code that ignores the sidecar can still
+rewrite the database. It is not a distributed lease, authentication mechanism,
+or substitute for transaction isolation. Windows and inherited handles after
+`fork()` are outside the verified contract.
 
 ## How is compaction made reviewable?
 
@@ -75,6 +92,6 @@ hidden behind a "backup complete" message.
 
 ## Highest-risk next change
 
-Concurrent-open handling needs a clear lock lifetime, stale-handle behavior, and
-independent-process tests. A lock around individual writes would be insufficient
-because each process also maintains a derived in-memory index and sequence.
+Performance evidence must be deterministic and must distinguish measured
+educational workloads from production claims. Structured events must remain
+useful without exposing keys, values, paths, or backup contents.
