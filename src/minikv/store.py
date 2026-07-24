@@ -9,8 +9,9 @@ import unicodedata
 import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
-from typing import BinaryIO, Final, Self
+from typing import BinaryIO, Final, NoReturn, Self
 
 from minikv.errors import ClosedError, CorruptionError, LimitError, PersistenceError
 
@@ -20,6 +21,9 @@ PUT: Final = 1
 DELETE: Final = 2
 HEADER: Final = struct.Struct(">4sBBQII")
 CHECKSUM: Final = struct.Struct(">I")
+BACKUP_MAGIC: Final = b"MKB1"
+BACKUP_VERSION: Final = 1
+BACKUP_HEADER: Final = struct.Struct(">4sBBHQQ32s")
 MAX_KEY_BYTES: Final = 1_024
 MAX_VALUE_BYTES: Final = 1_048_576
 DEFAULT_MAX_DATABASE_BYTES: Final = 64 * 1_048_576
@@ -46,6 +50,29 @@ class CompactionStats:
     old_log_bytes: int
     new_log_bytes: int
     reclaimed_bytes: int
+    parent_directory_fsynced: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BackupStats:
+    """Non-sensitive outcome of a successfully published backup."""
+
+    entries: int
+    payload_bytes: int
+    artifact_bytes: int
+    payload_sha256: str
+    replaced_existing: bool
+    parent_directory_fsynced: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreStats:
+    """Non-sensitive outcome of a successfully restored backup."""
+
+    entries: int
+    payload_bytes: int
+    payload_sha256: str
+    replaced_existing: bool
     parent_directory_fsynced: bool
 
 
@@ -428,9 +455,13 @@ class MiniKV:
                 raise CorruptionError(msg)
 
     def _fsync_parent_directory(self) -> bool:
+        return self._fsync_directory(self._path.parent)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> bool:
         if os.name != "posix" or not hasattr(os, "O_DIRECTORY"):
             return False
-        descriptor = os.open(self._path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(descriptor)
         finally:
@@ -529,6 +560,451 @@ class MiniKV:
             new_log_bytes=len(content),
             reclaimed_bytes=max(0, old_log_bytes - len(content)),
             parent_directory_fsynced=parent_directory_fsynced,
+        )
+
+    @staticmethod
+    def _validate_regular_path(path: Path, *, label: str) -> os.stat_result:
+        metadata = path.stat(follow_symlinks=False)
+        if stat.S_ISLNK(metadata.st_mode):
+            msg = f"{label} must not be a symbolic link"
+            raise ValueError(msg)
+        if not stat.S_ISREG(metadata.st_mode):
+            msg = f"{label} must be a regular file"
+            raise ValueError(msg)
+        return metadata
+
+    @staticmethod
+    def _path_identity_or_none(path: Path, *, label: str) -> tuple[int, int] | None:
+        try:
+            metadata = MiniKV._validate_regular_path(path, label=label)
+        except FileNotFoundError:
+            return None
+        return MiniKV._identity(metadata)
+
+    @staticmethod
+    def _assert_optional_path_identity(
+        path: Path,
+        expected: tuple[int, int] | None,
+        *,
+        label: str,
+        appeared_message: str,
+        replaced_message: str,
+    ) -> None:
+        current = MiniKV._path_identity_or_none(path, label=label)
+        if expected is None and current is not None:
+            raise PersistenceError(appeared_message)
+        if expected is not None and current != expected:
+            raise PersistenceError(replaced_message)
+
+    @staticmethod
+    def _exclusive_file(path: Path) -> tuple[BinaryIO, tuple[int, int]]:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags, 0o600)
+        return os.fdopen(descriptor, "w+b", buffering=0), MiniKV._identity(os.fstat(descriptor))
+
+    @staticmethod
+    def _backup_artifact(payload: bytes, entries: int) -> tuple[bytes, str]:
+        digest = sha256(payload).digest()
+        header = BACKUP_HEADER.pack(
+            BACKUP_MAGIC,
+            BACKUP_VERSION,
+            FORMAT_VERSION,
+            0,
+            entries,
+            len(payload),
+            digest,
+        )
+        return header + payload, digest.hex()
+
+    @staticmethod
+    def _validate_backup_header(
+        header_bytes: bytes,
+        *,
+        artifact_bytes: int,
+        max_database_bytes: int,
+    ) -> tuple[int, int, bytes]:
+        magic, version, log_version, reserved, entries, payload_bytes, digest = (
+            BACKUP_HEADER.unpack(header_bytes)
+        )
+        if magic != BACKUP_MAGIC:
+            msg = "invalid backup magic"
+            raise CorruptionError(msg)
+        if version != BACKUP_VERSION:
+            msg = "unsupported backup version"
+            raise CorruptionError(msg)
+        if log_version != FORMAT_VERSION:
+            msg = "unsupported backup log format"
+            raise CorruptionError(msg)
+        if reserved != 0:
+            msg = "backup reserved field must be zero"
+            raise CorruptionError(msg)
+        if payload_bytes > max_database_bytes:
+            msg = "backup payload exceeds the configured database limit"
+            raise LimitError(msg)
+        if artifact_bytes != BACKUP_HEADER.size + payload_bytes:
+            msg = "backup artifact length does not match its header"
+            raise CorruptionError(msg)
+        return entries, payload_bytes, digest
+
+    @staticmethod
+    def _read_backup_artifact(
+        path: Path,
+        *,
+        max_database_bytes: int,
+    ) -> tuple[bytes, int, str, tuple[int, int]]:
+        metadata = MiniKV._validate_regular_path(path, label="backup path")
+        identity = MiniKV._identity(metadata)
+        artifact_bytes = metadata.st_size
+        if artifact_bytes < BACKUP_HEADER.size:
+            msg = "backup artifact is truncated"
+            raise CorruptionError(msg)
+        if artifact_bytes > BACKUP_HEADER.size + max_database_bytes:
+            msg = "backup artifact exceeds the configured database limit"
+            raise LimitError(msg)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb", buffering=0) as source:
+            if MiniKV._identity(os.fstat(source.fileno())) != identity:
+                msg = "backup path was replaced while it was being opened"
+                raise PersistenceError(msg)
+            header_bytes = source.read(BACKUP_HEADER.size)
+            if len(header_bytes) != BACKUP_HEADER.size:
+                msg = "backup artifact is truncated"
+                raise CorruptionError(msg)
+            entries, payload_bytes, digest = MiniKV._validate_backup_header(
+                header_bytes,
+                artifact_bytes=artifact_bytes,
+                max_database_bytes=max_database_bytes,
+            )
+            payload = source.read(payload_bytes)
+            if len(payload) != payload_bytes or source.read(1):
+                msg = "backup artifact is truncated or contains trailing bytes"
+                raise CorruptionError(msg)
+        if sha256(payload).digest() != digest:
+            msg = "backup payload SHA-256 mismatch"
+            raise CorruptionError(msg)
+        return payload, entries, digest.hex(), identity
+
+    @staticmethod
+    def _validate_restored_payload(
+        path: Path,
+        *,
+        expected_entries: int,
+        expected_bytes: int,
+        max_database_bytes: int,
+    ) -> None:
+        with MiniKV.open(path, max_database_bytes=max_database_bytes) as candidate:
+            stats = candidate.stats()
+            if stats.entries != expected_entries or stats.sequence != expected_entries:
+                msg = "backup entry count does not match its payload"
+                raise CorruptionError(msg)
+            if stats.log_bytes != expected_bytes or stats.recovered_bytes != 0:
+                msg = "backup payload is not a complete canonical log"
+                raise CorruptionError(msg)
+            expected = b"".join(
+                MiniKV._frame(
+                    PUT,
+                    sequence,
+                    key.encode("utf-8"),
+                    candidate.get(key) or b"",
+                )
+                for sequence, key in enumerate(candidate.keys(), start=1)
+            )
+            if expected != path.read_bytes():
+                msg = "backup payload is not in canonical form"
+                raise CorruptionError(msg)
+
+    @staticmethod
+    def _write_fsynced_temporary(
+        path: Path,
+        content: bytes,
+        *,
+        stage_prefix: str,
+        fault_hook: FaultHook | None,
+    ) -> tuple[int, int]:
+        output, identity = MiniKV._exclusive_file(path)
+        try:
+            split = len(content) // 2
+            MiniKV._write_all_to(output, content[:split])
+            if fault_hook is not None:
+                fault_hook(f"{stage_prefix}_after_partial_write")
+            MiniKV._write_all_to(output, content[split:])
+            if fault_hook is not None:
+                fault_hook(f"{stage_prefix}_after_write")
+            output.flush()
+            if fault_hook is not None:
+                fault_hook(f"{stage_prefix}_after_flush")
+            os.fsync(output.fileno())
+        except Exception:
+            output.close()
+            MiniKV._cleanup_owned_temporary(path, identity)
+            raise
+        output.close()
+        return identity
+
+    def _validate_backup_publication(
+        self,
+        temporary: Path,
+        target: Path,
+        *,
+        expected: tuple[bytes, str],
+        target_identity: tuple[int, int] | None,
+        parent_identity: tuple[int, int],
+    ) -> None:
+        payload, digest = expected
+        verified_payload, verified_entries, verified_digest, _ = self._read_backup_artifact(
+            temporary,
+            max_database_bytes=self._max_database_bytes,
+        )
+        if (
+            verified_payload != payload
+            or verified_entries != len(self._index)
+            or verified_digest != digest
+        ):
+            msg = "published backup does not match the current logical state"
+            raise CorruptionError(msg)
+        self._assert_path_identity()
+        if self._identity(target.parent.stat()) != parent_identity:
+            msg = "backup parent directory was replaced"
+            raise PersistenceError(msg)
+        self._assert_optional_path_identity(
+            target,
+            target_identity,
+            label="backup destination",
+            appeared_message="backup destination appeared during publication",
+            replaced_message="backup destination was replaced during publication",
+        )
+
+    def backup(self, destination: str | os.PathLike[str]) -> BackupStats:
+        """Atomically publish a validated canonical backup artifact."""
+        self._ensure_open()
+        self._assert_path_identity()
+        target = Path(destination).absolute()
+        if target == self._path:
+            msg = "backup destination must differ from the database path"
+            raise ValueError(msg)
+        target_identity = self._path_identity_or_none(target, label="backup destination")
+        if target_identity == self._file_identity:
+            msg = "backup destination must not alias the database path"
+            raise ValueError(msg)
+        parent_identity = self._identity(target.parent.stat())
+        payload = self._canonical_log()
+        artifact, digest = self._backup_artifact(payload, len(self._index))
+        temporary = target.with_name(f".{target.name}.backup.tmp")
+        if temporary.exists() or temporary.is_symlink():
+            msg = "backup temporary path already exists"
+            raise PersistenceError(msg)
+
+        temporary_identity: tuple[int, int] | None = None
+        replaced = False
+        try:
+            temporary_identity = self._write_fsynced_temporary(
+                temporary,
+                artifact,
+                stage_prefix="backup",
+                fault_hook=self._fault_hook,
+            )
+            self._invoke_fault_hook("backup_before_validation")
+            self._invoke_fault_hook("backup_before_replace")
+            self._validate_backup_publication(
+                temporary,
+                target,
+                expected=(payload, digest),
+                target_identity=target_identity,
+                parent_identity=parent_identity,
+            )
+            temporary.replace(target)
+            replaced = True
+            self._invoke_fault_hook("backup_after_replace")
+            self._invoke_fault_hook("backup_before_directory_fsync")
+            directory_fsynced = self._fsync_directory(target.parent)
+        except Exception as error:
+            if not replaced:
+                if temporary_identity is not None:
+                    self._cleanup_owned_temporary(temporary, temporary_identity)
+                if isinstance(error, (LimitError, PersistenceError, ValueError)):
+                    raise
+                msg = "backup failed before publication; previous destination preserved"
+                raise PersistenceError(msg) from error
+            msg = (
+                "backup was published but directory durability was not confirmed; "
+                "inspect the destination"
+            )
+            raise PersistenceError(msg) from error
+
+        return BackupStats(
+            entries=len(self._index),
+            payload_bytes=len(payload),
+            artifact_bytes=len(artifact),
+            payload_sha256=digest,
+            replaced_existing=target_identity is not None,
+            parent_directory_fsynced=directory_fsynced,
+        )
+
+    @classmethod
+    def _validate_restore_paths(
+        cls,
+        source: Path,
+        target: Path,
+        *,
+        source_identity: tuple[int, int],
+        target_identity: tuple[int, int] | None,
+        parent_identity: tuple[int, int],
+    ) -> None:
+        if cls._identity(cls._validate_regular_path(source, label="backup path")) != (
+            source_identity
+        ):
+            msg = "backup source was replaced during restore"
+            raise PersistenceError(msg)
+        if cls._identity(target.parent.stat()) != parent_identity:
+            msg = "restore parent directory was replaced"
+            raise PersistenceError(msg)
+        cls._assert_optional_path_identity(
+            target,
+            target_identity,
+            label="restore destination",
+            appeared_message="restore destination appeared during restore",
+            replaced_message="restore destination was replaced during restore",
+        )
+
+    @staticmethod
+    def _validate_restore_options(*, overwrite: object, max_database_bytes: int) -> None:
+        if not isinstance(overwrite, bool):
+            msg = "overwrite must be a boolean"
+            raise TypeError(msg)
+        if not isinstance(max_database_bytes, int) or isinstance(max_database_bytes, bool):
+            msg = "max_database_bytes must be an integer"
+            raise TypeError(msg)
+        if not 1 <= max_database_bytes <= HARD_MAX_DATABASE_BYTES:
+            msg = f"max_database_bytes must be between 1 and {HARD_MAX_DATABASE_BYTES}"
+            raise LimitError(msg)
+
+    @classmethod
+    def _restore_target_identity(
+        cls,
+        target: Path,
+        *,
+        source_identity: tuple[int, int],
+        overwrite: bool,
+    ) -> tuple[int, int] | None:
+        target_identity = cls._path_identity_or_none(target, label="restore destination")
+        if target_identity == source_identity:
+            msg = "restore destination must not alias the backup path"
+            raise ValueError(msg)
+        if target_identity is not None and not overwrite:
+            msg = "restore destination exists; set overwrite=True to replace it"
+            raise FileExistsError(msg)
+        return target_identity
+
+    @staticmethod
+    def _raise_restore_failure(
+        error: Exception,
+        *,
+        replaced: bool,
+        temporary: Path,
+        temporary_identity: tuple[int, int] | None,
+    ) -> NoReturn:
+        if not replaced:
+            if temporary_identity is not None:
+                MiniKV._cleanup_owned_temporary(temporary, temporary_identity)
+            if isinstance(
+                error,
+                (CorruptionError, LimitError, PersistenceError, ValueError, FileExistsError),
+            ):
+                raise error
+            msg = "restore failed before replacement; previous destination preserved"
+            raise PersistenceError(msg) from error
+        msg = (
+            "restore replaced the destination but directory durability was not "
+            "confirmed; reopen and inspect the destination"
+        )
+        raise PersistenceError(msg) from error
+
+    @classmethod
+    def restore(
+        cls,
+        backup: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+        *,
+        overwrite: bool = False,
+        max_database_bytes: int = DEFAULT_MAX_DATABASE_BYTES,
+        fault_hook: FaultHook | None = None,
+    ) -> RestoreStats:
+        """Validate a backup fully, then atomically restore an inactive path."""
+        cls._validate_restore_options(
+            overwrite=overwrite,
+            max_database_bytes=max_database_bytes,
+        )
+        source = Path(backup).absolute()
+        target = Path(destination).absolute()
+        if source == target:
+            msg = "restore destination must differ from the backup path"
+            raise ValueError(msg)
+        payload, entries, digest, source_identity = cls._read_backup_artifact(
+            source,
+            max_database_bytes=max_database_bytes,
+        )
+        target_identity = cls._restore_target_identity(
+            target,
+            source_identity=source_identity,
+            overwrite=overwrite,
+        )
+        parent_identity = cls._identity(target.parent.stat())
+        temporary = target.with_name(f".{target.name}.restore.tmp")
+        if temporary.exists() or temporary.is_symlink():
+            msg = "restore temporary path already exists"
+            raise PersistenceError(msg)
+
+        temporary_identity: tuple[int, int] | None = None
+        replaced = False
+        try:
+            temporary_identity = cls._write_fsynced_temporary(
+                temporary,
+                payload,
+                stage_prefix="restore",
+                fault_hook=fault_hook,
+            )
+            if fault_hook is not None:
+                fault_hook("restore_before_validation")
+            cls._validate_restored_payload(
+                temporary,
+                expected_entries=entries,
+                expected_bytes=len(payload),
+                max_database_bytes=max_database_bytes,
+            )
+            if fault_hook is not None:
+                fault_hook("restore_before_replace")
+            cls._validate_restore_paths(
+                source,
+                target,
+                source_identity=source_identity,
+                target_identity=target_identity,
+                parent_identity=parent_identity,
+            )
+            temporary.replace(target)
+            replaced = True
+            if fault_hook is not None:
+                fault_hook("restore_after_replace")
+                fault_hook("restore_before_directory_fsync")
+            directory_fsynced = cls._fsync_directory(target.parent)
+        except (CorruptionError, LimitError, OSError, PersistenceError, ValueError) as error:
+            cls._raise_restore_failure(
+                error,
+                replaced=replaced,
+                temporary=temporary,
+                temporary_identity=temporary_identity,
+            )
+
+        return RestoreStats(
+            entries=entries,
+            payload_bytes=len(payload),
+            payload_sha256=digest,
+            replaced_existing=target_identity is not None,
+            parent_directory_fsynced=directory_fsynced,
         )
 
     def close(self) -> None:

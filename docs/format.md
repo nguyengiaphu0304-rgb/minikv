@@ -43,3 +43,28 @@ ordered by Python's deterministic Unicode code-point ordering after NFC
 normalization. Sequence numbers restart at one and remain contiguous. There are
 no delete frames or superseded values. Therefore identical logical state
 produces identical compacted bytes on the same format version.
+
+## Backup artifact format v1
+
+A backup artifact begins with one fixed-width 56-byte header followed by a
+canonical compacted log payload:
+
+| Field | Width | Encoding | Meaning |
+| --- | ---: | --- | --- |
+| magic | 4 bytes | ASCII `MKB1` | Backup discriminator |
+| backup version | 1 byte | unsigned | Currently `1` |
+| log format | 1 byte | unsigned | Currently MiniKV log v1 |
+| reserved | 2 bytes | unsigned | Must be zero |
+| entry count | 8 bytes | big-endian unsigned | Live entries in payload |
+| payload length | 8 bytes | big-endian unsigned | Exact following byte count |
+| payload digest | 32 bytes | SHA-256 | Digest of payload only |
+| payload | variable | MiniKV log v1 | Complete canonical compacted form |
+
+Unknown versions, non-zero reserved bits, truncation, trailing bytes, length or
+digest mismatch, non-canonical payloads, count mismatch, and any ordinary log
+violation are rejected before restore changes its destination. Artifact size is
+bounded by the configured database limit plus the fixed header.
+
+SHA-256 provides corruption evidence and deterministic lineage. It does not
+authenticate who created the backup; a malicious writer can replace both
+payload and digest.
