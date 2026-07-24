@@ -39,9 +39,21 @@ The design needs an explicit lock and lifetime rules, stale-handle behavior, and
 tests across independent processes. Merely relying on append mode would not make
 sequence allocation or index state safe.
 
-## Highest-risk next change
+## How is compaction made reviewable?
 
 Compaction rewrites all live state and replaces the authoritative file. It needs
 a temporary-file allowlist, flush and `fsync` ordering, atomic replacement,
 directory durability where supported, rollback/failure injection, and proof that
-the original remains recoverable at every interrupted boundary.
+the original remains recoverable at every pre-replacement boundary. MiniKV also
+validates the temporary file through the normal independent startup scanner and
+rechecks file identities immediately before replacement.
+
+The important honesty boundary is after replacement: if directory `fsync` or
+rebinding fails, the code cannot truthfully claim rollback. It closes the handle,
+reports that replacement occurred, and requires a reopen.
+
+## Highest-risk next change
+
+Backup/restore must define artifact naming, overwrite policy, logical and byte
+integrity evidence, retention assumptions, and recovery behavior without
+confusing a copy with a durable off-device backup.

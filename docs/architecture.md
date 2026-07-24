@@ -13,6 +13,9 @@ persistence mechanism.
 4. The recovery path truncates only an incomplete final frame. Complete invalid
    frames stop startup without altering the file.
 5. `StoreStats` exposes only counts and byte sizes, never keys or values.
+6. Compaction derives a canonical log from sorted live keys, writes and validates
+   a private sibling file, atomically replaces the source, requests directory
+   durability, and rebinds the active handle.
 
 ```text
 caller
@@ -39,11 +42,17 @@ public validation -> frame encoder -> append / flush / fsync
 - Failure before acknowledgement attempts to truncate back to the last durable
   offset. If rollback cannot be confirmed, the handle closes and fails loudly.
 - String keys have exactly one stored representation: strict UTF-8 in NFC.
+- Compaction rechecks the open file and parent-directory identities before
+  replacement, so path substitution is rejected rather than overwriting an
+  unrelated file.
+- A pre-replacement failure preserves the source. A post-replacement durability
+  failure closes the handle and requires explicit reopen because rolling back
+  safely can no longer be guaranteed.
 
 ## Deliberate scope
 
-The foundation optimizes for a readable storage contract, deterministic tests,
-and explicit failure behavior. It does not claim multi-process coordination or
-database-grade transactional guarantees. Compaction and validated backup are
-separate milestones because both require additional atomic-replacement and
+The engine optimizes for a readable storage contract, deterministic tests, and
+explicit failure behavior. It does not claim multi-process coordination or
+database-grade transactional guarantees. Validated backup remains a separate
+milestone because publication and retention introduce different integrity and
 recovery contracts.

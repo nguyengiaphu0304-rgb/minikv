@@ -24,19 +24,26 @@ untrusted.
 - Complete corruption fails closed and leaves bytes untouched.
 - Statistics contain counts and sizes, not application payloads.
 - Zero production dependencies reduce supply-chain surface.
+- Compaction uses an exclusive owner-only sibling file, validates reconstructed
+  state before replacement, rechecks source/parent identities, and never deletes
+  a colliding path it did not create.
 
 ## Out of scope and residual risks
 
 - CRC32 is forgeable; a malicious writer can alter data and recompute it.
-- Parent-directory replacement and platform-specific path races are not fully
-  eliminated.
+- Source and parent replacement are detected at explicit boundaries, but
+  platform-specific time-of-check/time-of-use races are not fully eliminated.
 - No inter-process lock prevents simultaneous writers.
 - No encryption at rest, key management, secure deletion, or access-control
   layer is provided.
-- Deleted and overwritten values remain recoverable from the append-only file.
+- Compaction removes deleted and overwritten values from the active file, but
+  storage media, snapshots, backups, or forensic recovery may retain them.
 - Denial of service remains possible within configured size limits.
 - No protection exists against disk rollback, media failure, or a dishonest OS.
 - Fault injection does not prove behavior under physical power loss.
+- After atomic replacement but before directory `fsync`, a crash can leave the
+  old or new directory entry depending on filesystem semantics. An observed
+  failure in that boundary closes the handle and requires reopen.
 
 Applications needing adversarial integrity, confidentiality, multi-writer
 coordination, or durable remote recovery should use a production database and

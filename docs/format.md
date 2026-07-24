@@ -35,3 +35,11 @@ malformed lengths from triggering unbounded allocation.
 
 CRC32 is an accidental-corruption check, not a signature or message
 authentication code.
+
+## Canonical compacted form
+
+A compacted v1 log contains exactly one put frame for each live key. Keys are
+ordered by Python's deterministic Unicode code-point ordering after NFC
+normalization. Sequence numbers restart at one and remain contiguous. There are
+no delete frames or superseded values. Therefore identical logical state
+produces identical compacted bytes on the same format version.
