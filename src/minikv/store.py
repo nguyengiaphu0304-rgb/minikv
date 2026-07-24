@@ -39,6 +39,17 @@ class StoreStats:
 
 
 @dataclass(frozen=True, slots=True)
+class CompactionStats:
+    """Non-sensitive outcome of a successful compaction."""
+
+    entries: int
+    old_log_bytes: int
+    new_log_bytes: int
+    reclaimed_bytes: int
+    parent_directory_fsynced: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _FrameHeader:
     magic: bytes
     version: int
@@ -58,13 +69,17 @@ class MiniKV:
 
     def __init__(
         self,
+        path: Path,
         file: BinaryIO,
         *,
         max_database_bytes: int,
         fault_hook: FaultHook | None,
     ) -> None:
         """Build an index from an already validated and opened file."""
+        self._path = path
         self._file = file
+        self._file_identity = self._identity(os.fstat(file.fileno()))
+        self._parent_identity = self._identity(path.parent.stat())
         self._max_database_bytes = max_database_bytes
         self._fault_hook = fault_hook
         self._index: dict[str, bytes] = {}
@@ -83,7 +98,7 @@ class MiniKV:
         fault_hook: FaultHook | None = None,
     ) -> MiniKV:
         """Open or create a database without following a final-component symlink."""
-        database = Path(path)
+        database = Path(path).absolute()
         if not isinstance(max_database_bytes, int) or isinstance(max_database_bytes, bool):
             msg = "max_database_bytes must be an integer"
             raise TypeError(msg)
@@ -109,6 +124,7 @@ class MiniKV:
         file = os.fdopen(descriptor, "r+b", buffering=0)
         try:
             return cls(
+                database,
                 file,
                 max_database_bytes=max_database_bytes,
                 fault_hook=fault_hook,
@@ -129,6 +145,27 @@ class MiniKV:
     def _ensure_open(self) -> None:
         if self._closed:
             raise ClosedError
+
+    @staticmethod
+    def _identity(metadata: os.stat_result) -> tuple[int, int]:
+        return metadata.st_dev, metadata.st_ino
+
+    def _assert_path_identity(self) -> None:
+        try:
+            path_metadata = self._path.stat(follow_symlinks=False)
+            parent_metadata = self._path.parent.stat()
+        except OSError as error:
+            msg = "database path or parent is no longer available"
+            raise PersistenceError(msg) from error
+        if not stat.S_ISREG(path_metadata.st_mode):
+            msg = "database path no longer names a regular file"
+            raise PersistenceError(msg)
+        if self._identity(path_metadata) != self._file_identity:
+            msg = "database path was replaced while the handle was open"
+            raise PersistenceError(msg)
+        if self._identity(parent_metadata) != self._parent_identity:
+            msg = "database parent directory was replaced while the handle was open"
+            raise PersistenceError(msg)
 
     @staticmethod
     def _key_bytes(key: object) -> tuple[str, bytes]:
@@ -262,14 +299,18 @@ class MiniKV:
         os.fsync(self._file.fileno())
         self._recovered_bytes += original_bytes - valid_bytes
 
-    def _write_all(self, content: bytes) -> None:
+    @staticmethod
+    def _write_all_to(file: BinaryIO, content: bytes) -> None:
         pending = memoryview(content)
         while pending:
-            written = self._file.write(pending)
+            written = file.write(pending)
             if written is None or written <= 0:
                 msg = "storage write made no forward progress"
                 raise OSError(msg)
             pending = pending[written:]
+
+    def _write_all(self, content: bytes) -> None:
+        self._write_all_to(self._file, content)
 
     def _append(self, operation: int, key: str, key_bytes: bytes, value: bytes) -> None:
         sequence = self._sequence + 1
@@ -341,6 +382,153 @@ class MiniKV:
             sequence=self._sequence,
             log_bytes=self._log_bytes,
             recovered_bytes=self._recovered_bytes,
+        )
+
+    def _canonical_log(self) -> bytes:
+        frames: list[bytes] = []
+        total = 0
+        for sequence, key in enumerate(sorted(self._index), start=1):
+            frame = self._frame(PUT, sequence, key.encode("utf-8"), self._index[key])
+            total += len(frame)
+            if total > self._max_database_bytes:
+                msg = "compacted state would exceed the configured database limit"
+                raise LimitError(msg)
+            frames.append(frame)
+        return b"".join(frames)
+
+    def _invoke_fault_hook(self, stage: str) -> None:
+        if self._fault_hook is not None:
+            self._fault_hook(stage)
+
+    def _temporary_path(self) -> Path:
+        return self._path.with_name(f".{self._path.name}.compact.tmp")
+
+    @staticmethod
+    def _cleanup_owned_temporary(path: Path, identity: tuple[int, int]) -> None:
+        try:
+            metadata = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if MiniKV._identity(metadata) == identity:
+            path.unlink()
+
+    def _validate_compacted_file(self, path: Path, expected_bytes: int) -> None:
+        with MiniKV.open(path, max_database_bytes=self._max_database_bytes) as candidate:
+            if candidate.keys() != tuple(sorted(self._index)) or any(
+                candidate.get(key) != value for key, value in self._index.items()
+            ):
+                msg = "compacted file does not reconstruct the expected logical state"
+                raise CorruptionError(msg)
+            candidate_stats = candidate.stats()
+            if (
+                candidate_stats.sequence != len(self._index)
+                or candidate_stats.log_bytes != expected_bytes
+            ):
+                msg = "compacted file metadata does not match the canonical state"
+                raise CorruptionError(msg)
+
+    def _fsync_parent_directory(self) -> bool:
+        if os.name != "posix" or not hasattr(os, "O_DIRECTORY"):
+            return False
+        descriptor = os.open(self._path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return True
+
+    def _rebind_after_compaction(self, new_log_bytes: int) -> None:
+        self._file.close()
+        flags = os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(self._path, flags)
+        self._file = os.fdopen(descriptor, "r+b", buffering=0)
+        self._file_identity = self._identity(os.fstat(self._file.fileno()))
+        self._parent_identity = self._identity(self._path.parent.stat())
+        self._sequence = len(self._index)
+        self._log_bytes = new_log_bytes
+        self._file.seek(new_log_bytes)
+
+    def _write_compaction_temporary(self, path: Path, content: bytes) -> tuple[int, int]:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags, 0o600)
+        identity = self._identity(os.fstat(descriptor))
+        temporary_file = os.fdopen(descriptor, "w+b", buffering=0)
+        try:
+            split = len(content) // 2
+            self._write_all_to(temporary_file, content[:split])
+            self._invoke_fault_hook("compact_after_partial_write")
+            self._write_all_to(temporary_file, content[split:])
+            self._invoke_fault_hook("compact_after_write")
+            temporary_file.flush()
+            self._invoke_fault_hook("compact_after_flush")
+            os.fsync(temporary_file.fileno())
+        except Exception:
+            temporary_file.close()
+            self._cleanup_owned_temporary(path, identity)
+            raise
+        temporary_file.close()
+        return identity
+
+    def compact(self) -> CompactionStats:
+        """Atomically replace mutation history with canonical live-state frames.
+
+        Failures before replacement preserve the original database. A failure after
+        replacement closes this handle because directory durability or rebinding
+        could not be confirmed; callers must reopen the path and inspect the raised
+        error.
+        """
+        self._ensure_open()
+        self._assert_path_identity()
+        content = self._canonical_log()
+        old_log_bytes = self._log_bytes
+        temporary_path = self._temporary_path()
+        try:
+            temporary_path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            msg = "compaction temporary path already exists"
+            raise PersistenceError(msg)
+
+        temporary_identity: tuple[int, int] | None = None
+        replaced = False
+        try:
+            temporary_identity = self._write_compaction_temporary(temporary_path, content)
+            self._invoke_fault_hook("compact_before_validation")
+            self._validate_compacted_file(temporary_path, len(content))
+            self._assert_path_identity()
+            self._invoke_fault_hook("compact_before_replace")
+            temporary_path.replace(self._path)
+            replaced = True
+            self._invoke_fault_hook("compact_after_replace")
+            self._invoke_fault_hook("compact_before_directory_fsync")
+            parent_directory_fsynced = self._fsync_parent_directory()
+            self._rebind_after_compaction(len(content))
+        except Exception as error:
+            if not replaced:
+                if temporary_identity is not None:
+                    self._cleanup_owned_temporary(temporary_path, temporary_identity)
+                if isinstance(error, (LimitError, PersistenceError)):
+                    raise
+                msg = "compaction failed before replacement; original database preserved"
+                raise PersistenceError(msg) from error
+            self.close()
+            msg = (
+                "compaction replaced the database but post-replacement durability "
+                "was not confirmed; reopen required"
+            )
+            raise PersistenceError(msg) from error
+
+        return CompactionStats(
+            entries=len(self._index),
+            old_log_bytes=old_log_bytes,
+            new_log_bytes=len(content),
+            reclaimed_bytes=max(0, old_log_bytes - len(content)),
+            parent_directory_fsynced=parent_directory_fsynced,
         )
 
     def close(self) -> None:

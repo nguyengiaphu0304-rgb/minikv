@@ -7,6 +7,7 @@ from minikv.store import (
     HARD_MAX_DATABASE_BYTES,
     MAX_KEY_BYTES,
     MAX_VALUE_BYTES,
+    CompactionStats,
     MiniKV,
     StoreStats,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "MAX_KEY_BYTES",
     "MAX_VALUE_BYTES",
     "ClosedError",
+    "CompactionStats",
     "CorruptionError",
     "LimitError",
     "MiniKV",
