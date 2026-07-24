@@ -37,9 +37,21 @@ jobs:
           ruff check .
           ruff format --check .
       - name: Static typing
-        run: mypy
+        run: mypy src scripts
       - name: Tests
         run: pytest
+      - name: Deterministic workload evidence
+        run: |
+          python scripts/workload_evidence.py \
+            --baseline evidence/workload-v1.json \
+            --output workload-observation.json
+      - name: Upload workload observation
+        uses: actions/upload-artifact@v4
+        with:
+          name: workload-observation-python-${{ matrix.python-version }}
+          path: workload-observation.json
+          if-no-files-found: error
+          retention-days: 14
       - name: Build package
         run: python -m build
       - name: Dependency consistency

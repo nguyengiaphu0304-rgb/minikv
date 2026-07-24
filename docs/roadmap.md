@@ -14,8 +14,8 @@
 - [x] Validated backup/restore with logical-content equality evidence.
 - [x] POSIX lifetime lock and concurrent-open/restore rejection with
   independent-process crash evidence.
-- [ ] Deterministic performance and data-quality report with budgets.
-- [ ] Structured operational events that do not expose keys or values.
+- [x] Deterministic workload and data-quality report with broad smoke budgets.
+- [x] Structured operational events that do not expose keys, values, or paths.
 
 ## v1.0 — portfolio release
 

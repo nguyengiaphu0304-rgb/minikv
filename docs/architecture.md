@@ -22,6 +22,12 @@ persistence mechanism.
 8. Restore locks the destination, validates the envelope and SHA-256 before writing, runs the extracted
    payload through the ordinary startup scanner, checks canonical equality, and
    atomically replaces only a destination it exclusively coordinates.
+9. The event boundary constructs immutable allowlisted metrics only after each
+   successful state transition. Callback failures increment a dropped count
+   without changing persistence outcomes.
+10. The evidence runner executes a fixed synthetic lifecycle, separates stable
+    lineage from observed durations, and compares stable facts with a checked
+    baseline.
 
 ```text
 caller
@@ -64,6 +70,11 @@ lifetime lock -> public validation -> frame encoder -> append / flush / fsync
   persistent sidecar preserves a stable lock inode across clean close and crash.
   Database and lock identities are checked before every mutation and destructive
   replacement boundary.
+- Event construction accepts only fixed names and exact per-name metric sets.
+  Application payloads and environment identifiers never enter the event model.
+- Timing observations are not part of the reproducibility contract. CI compares
+  operation counts, byte sizes, logical-state, backup, fixture, and event
+  digests while applying only broad timing smoke budgets.
 
 ## Deliberate scope
 
@@ -72,4 +83,6 @@ explicit failure behavior. It coordinates one writer among cooperating POSIX
 processes, but does not claim malicious-writer exclusion, distributed locking,
 remote backup durability, or database-grade transactional guarantees. Backup
 artifacts provide portable recovery evidence, not retention policy, encryption,
-or authenticated provenance.
+or authenticated provenance. Operational events are observability hints rather
+than a durable audit log, and the synthetic workload is correctness evidence
+rather than a production benchmark.

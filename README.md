@@ -5,7 +5,7 @@ and portfolio review. It demonstrates how an append-only log can acknowledge
 mutations only after durability, rebuild deterministic state after restart, and
 distinguish a torn final write from complete corrupt data.
 
-The current `v0.4` engine is intentionally single-writer and local. It is
+The current `v0.5` engine is intentionally single-writer and local. It is
 not a replacement for SQLite, RocksDB, Redis, or a production database.
 
 ## What it does
@@ -30,6 +30,10 @@ not a replacement for SQLite, RocksDB, Redis, or a production database.
   validation.
 - Requires explicit overwrite consent for restore and preserves the prior
   destination on every handled failure before atomic replacement.
+- Emits immutable versioned operational events containing only allowlisted
+  counts, byte sizes, sequence values, and durability booleans.
+- Includes an offline deterministic workload with checked lineage, data-quality
+  invariants, broad smoke budgets, and separately labeled timing observations.
 - Has no production dependencies.
 
 ## Install and verify
@@ -47,8 +51,11 @@ Run the same core checks used by CI:
 ```bash
 ruff check .
 ruff format --check .
-mypy
+mypy src scripts
 pytest
+python scripts/workload_evidence.py \
+  --baseline evidence/workload-v1.json \
+  --output /tmp/minikv-workload-observation.json
 python -m build
 python -m pip check
 python -m pip_audit --skip-editable
@@ -138,6 +145,32 @@ MiniKV rechecks both database and lock-file identities before mutations and
 replacement boundaries. This is an advisory protocol for cooperating MiniKV
 processes, not protection from software that ignores the lock.
 
+## Operational event contract
+
+Pass an `event_hook` to `MiniKV.open()` or `MiniKV.restore()` to receive
+immutable `OperationalEvent` values after successful open, mutation, compaction,
+backup, restore, and close boundaries. Event names and metrics use a strict
+versioned allowlist. They never include keys, values, paths, timestamps, process
+IDs, host identifiers, or exception text.
+
+A hook exception cannot undo a durable operation or turn it into a false
+failure. MiniKV suppresses that telemetry exception and increments
+`events_dropped` in non-sensitive stats. Events are synchronous and intended for
+small local adapters; network delivery, persistence, and retry policy belong
+outside the storage transaction.
+
+## Reproducible workload evidence
+
+[`evidence/workload-v1.json`](evidence/workload-v1.json) records only stable
+facts from a fully synthetic offline workload: operation counts, live entries,
+byte sizes, and SHA-256 lineage for fixtures, logical state, backup payload, and
+events. CI regenerates those fields exactly on Python 3.11–3.13.
+
+Durations are written to per-run CI artifacts and checked only against broad
+hang/explosive-growth budgets. They are environment-specific observations, not
+throughput guarantees, cross-machine comparisons, or production benchmarks.
+See the [methodology and evidence limits](docs/performance.md).
+
 ## Design documentation
 
 - [Architecture](docs/architecture.md)
@@ -145,10 +178,13 @@ processes, not protection from software that ignores the lock.
 - [Threat model](docs/threat-model.md)
 - [Roadmap](docs/roadmap.md)
 - [Interview guide](docs/interview-guide.md)
+- [Operational event schema](docs/events.md)
+- [Workload evidence methodology](docs/performance.md)
 - [ADR-001: append-only verified log](docs/adr/001-append-only-verified-log.md)
 - [ADR-002: validated atomic compaction](docs/adr/002-validated-atomic-compaction.md)
 - [ADR-003: canonical backup and atomic restore](docs/adr/003-canonical-backup-restore.md)
 - [ADR-004: POSIX lifetime lock](docs/adr/004-posix-lifetime-lock.md)
+- [ADR-005: privacy-safe events and evidence](docs/adr/005-operational-evidence.md)
 
 ## Current limitations
 
@@ -168,6 +204,10 @@ processes, not protection from software that ignores the lock.
 - Advisory locks do not stop malicious or non-cooperating writers. Network and
   distributed filesystems may not provide the local lock semantics MiniKV
   assumes; inherited handles after `fork()` are unsupported.
+- Operational events are synchronous best-effort callbacks, not durable audit
+  records. Dropped-event counts do not reconstruct missing events.
+- Workload timings are smoke observations from synthetic local data and do not
+  establish production capacity, latency percentiles, or filesystem durability.
 
-The next milestone adds repeatable performance/data-quality evidence and
-privacy-safe operational events before a `v1.0` release is considered.
+The next milestone prepares a reproducible demo, verified release artifacts,
+release notes, and residual-risk evidence for a `v1.0` candidate.
