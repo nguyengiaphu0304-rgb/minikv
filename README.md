@@ -5,7 +5,7 @@ and portfolio review. It demonstrates how an append-only log can acknowledge
 mutations only after durability, rebuild deterministic state after restart, and
 distinguish a torn final write from complete corrupt data.
 
-The current `v0.5` engine is intentionally single-writer and local. It is
+The current `v1.0` release candidate is intentionally single-writer and local. It is
 not a replacement for SQLite, RocksDB, Redis, or a production database.
 
 ## What it does
@@ -56,7 +56,10 @@ pytest
 python scripts/workload_evidence.py \
   --baseline evidence/workload-v1.json \
   --output /tmp/minikv-workload-observation.json
+python scripts/demo.py --output /tmp/minikv-demo
+python scripts/demo.py --verify /tmp/minikv-demo
 python -m build
+python scripts/verify_release.py --dist dist --write-checksums
 python -m pip check
 python -m pip_audit --skip-editable
 ```
@@ -180,11 +183,17 @@ See the [methodology and evidence limits](docs/performance.md).
 - [Interview guide](docs/interview-guide.md)
 - [Operational event schema](docs/events.md)
 - [Workload evidence methodology](docs/performance.md)
+- [Reproducible demo](docs/demo.md)
+- [Recovery support matrix](docs/recovery-support.md)
+- [v1.0.0 release notes](docs/releases/v1.0.0.md)
+- [Publication checklist](docs/releases/publication-checklist.md)
+- [Residual risks](docs/releases/residual-risks.md)
 - [ADR-001: append-only verified log](docs/adr/001-append-only-verified-log.md)
 - [ADR-002: validated atomic compaction](docs/adr/002-validated-atomic-compaction.md)
 - [ADR-003: canonical backup and atomic restore](docs/adr/003-canonical-backup-restore.md)
 - [ADR-004: POSIX lifetime lock](docs/adr/004-posix-lifetime-lock.md)
 - [ADR-005: privacy-safe events and evidence](docs/adr/005-operational-evidence.md)
+- [ADR-006: reproducible v1 release](docs/adr/006-reproducible-v1-release.md)
 
 ## Current limitations
 
@@ -209,5 +218,6 @@ See the [methodology and evidence limits](docs/performance.md).
 - Workload timings are smoke observations from synthetic local data and do not
   establish production capacity, latency percentiles, or filesystem durability.
 
-The next milestone prepares a reproducible demo, verified release artifacts,
-release notes, and residual-risk evidence for a `v1.0` candidate.
+All automated v1.0 source and package gates are prepared. Public release status
+still requires an annotated tag, a non-prerelease GitHub Release, and checksum
+verification at the exact CI-verified commit.

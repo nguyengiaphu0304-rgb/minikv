@@ -1,5 +1,7 @@
 """Public MiniKV API."""
 
+from importlib.metadata import version
+
 from minikv.errors import (
     ClosedError,
     ConcurrencyError,
@@ -24,6 +26,8 @@ from minikv.store import (
     StoreStats,
 )
 
+__version__ = version("minikv-store")
+
 __all__ = [
     "BACKUP_MAGIC",
     "BACKUP_VERSION",
@@ -46,4 +50,5 @@ __all__ = [
     "PersistenceError",
     "RestoreStats",
     "StoreStats",
+    "__version__",
 ]

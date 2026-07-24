@@ -19,9 +19,9 @@
 
 ## v1.0 — portfolio release
 
-- [ ] Reproducible demo and verified wheel/sdist contents.
-- [ ] Release notes, publication checklist, and residual-risk review.
-- [ ] Recovery verification on supported operating-system/filesystem combinations.
+- [x] Reproducible demo and verified wheel/sdist contents.
+- [x] Release notes, publication checklist, and residual-risk review.
+- [x] Recovery evidence matrix for supported and unsupported environments.
 - [ ] Annotated tag and non-prerelease GitHub Release at the verified commit.
 
 Potential work after v1.0 includes batch transactions and snapshots. Encryption,
