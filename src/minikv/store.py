@@ -21,6 +21,7 @@ from minikv.errors import (
     LimitError,
     PersistenceError,
 )
+from minikv.events import EventHook, EventName, MetricValue, OperationalEvent, operational_event
 
 MAGIC: Final = b"MKV1"
 FORMAT_VERSION: Final = 1
@@ -47,6 +48,7 @@ class StoreStats:
     sequence: int
     log_bytes: int
     recovered_bytes: int
+    events_dropped: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +83,7 @@ class RestoreStats:
     payload_sha256: str
     replaced_existing: bool
     parent_directory_fsynced: bool
+    events_dropped: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +107,7 @@ class _LifetimeLock:
 class _StoreOptions:
     max_database_bytes: int
     fault_hook: FaultHook | None
+    event_hook: EventHook | None
 
 
 class MiniKV:
@@ -131,12 +135,21 @@ class MiniKV:
         self._lock_identity = None if lock is None else lock.identity
         self._max_database_bytes = options.max_database_bytes
         self._fault_hook = options.fault_hook
+        self._event_hook = options.event_hook
+        self._event_sequence = 0
+        self._events_dropped = 0
         self._index: dict[str, bytes] = {}
         self._sequence = 0
         self._log_bytes = 0
         self._recovered_bytes = 0
         self._closed = False
         self._load()
+        self._emit_event(
+            "store.opened",
+            entries=len(self._index),
+            log_bytes=self._log_bytes,
+            recovered_bytes=self._recovered_bytes,
+        )
 
     @classmethod
     def open(
@@ -145,6 +158,7 @@ class MiniKV:
         *,
         max_database_bytes: int = DEFAULT_MAX_DATABASE_BYTES,
         fault_hook: FaultHook | None = None,
+        event_hook: EventHook | None = None,
     ) -> MiniKV:
         """Open or create a database without following a final-component symlink."""
         database = Path(path).absolute()
@@ -178,7 +192,7 @@ class MiniKV:
                     database,
                     file,
                     lock,
-                    _StoreOptions(max_database_bytes, fault_hook),
+                    _StoreOptions(max_database_bytes, fault_hook, event_hook),
                 )
             except Exception:
                 file.close()
@@ -280,7 +294,7 @@ class MiniKV:
                 path,
                 file,
                 None,
-                _StoreOptions(max_database_bytes, None),
+                _StoreOptions(max_database_bytes, None, None),
             )
         except Exception:
             file.close()
@@ -298,6 +312,21 @@ class MiniKV:
     def _ensure_open(self) -> None:
         if self._closed:
             raise ClosedError
+
+    @staticmethod
+    def _deliver_event(event_hook: EventHook | None, event: OperationalEvent) -> int:
+        if event_hook is None:
+            return 0
+        try:
+            event_hook(event)
+        except Exception:  # noqa: BLE001 - telemetry cannot reverse a durable operation.
+            return 1
+        return 0
+
+    def _emit_event(self, name: EventName, **metrics: MetricValue) -> None:
+        self._event_sequence += 1
+        event = operational_event(self._event_sequence, name, **metrics)
+        self._events_dropped += self._deliver_event(self._event_hook, event)
 
     @staticmethod
     def _identity(metadata: os.stat_result) -> tuple[int, int]:
@@ -506,8 +535,16 @@ class MiniKV:
         self._log_bytes += len(frame)
         if operation == PUT:
             self._index[key] = value
+            event_name: EventName = "mutation.put_committed"
         else:
             self._index.pop(key, None)
+            event_name = "mutation.delete_committed"
+        self._emit_event(
+            event_name,
+            entries=len(self._index),
+            log_bytes=self._log_bytes,
+            sequence=self._sequence,
+        )
 
     def get(self, key: str) -> bytes | None:
         """Return immutable value bytes or ``None`` when the key is absent."""
@@ -544,6 +581,7 @@ class MiniKV:
             sequence=self._sequence,
             log_bytes=self._log_bytes,
             recovered_bytes=self._recovered_bytes,
+            events_dropped=self._events_dropped,
         )
 
     def _canonical_log(self) -> bytes:
@@ -692,13 +730,22 @@ class MiniKV:
             )
             raise PersistenceError(msg) from error
 
-        return CompactionStats(
+        result = CompactionStats(
             entries=len(self._index),
             old_log_bytes=old_log_bytes,
             new_log_bytes=len(content),
             reclaimed_bytes=max(0, old_log_bytes - len(content)),
             parent_directory_fsynced=parent_directory_fsynced,
         )
+        self._emit_event(
+            "store.compacted",
+            entries=result.entries,
+            new_log_bytes=result.new_log_bytes,
+            old_log_bytes=result.old_log_bytes,
+            parent_directory_fsynced=result.parent_directory_fsynced,
+            reclaimed_bytes=result.reclaimed_bytes,
+        )
+        return result
 
     @staticmethod
     def _validate_regular_path(path: Path, *, label: str) -> os.stat_result:
@@ -983,7 +1030,7 @@ class MiniKV:
             )
             raise PersistenceError(msg) from error
 
-        return BackupStats(
+        result = BackupStats(
             entries=len(self._index),
             payload_bytes=len(payload),
             artifact_bytes=len(artifact),
@@ -991,6 +1038,15 @@ class MiniKV:
             replaced_existing=target_identity is not None,
             parent_directory_fsynced=directory_fsynced,
         )
+        self._emit_event(
+            "backup.published",
+            artifact_bytes=result.artifact_bytes,
+            entries=result.entries,
+            parent_directory_fsynced=result.parent_directory_fsynced,
+            payload_bytes=result.payload_bytes,
+            replaced_existing=result.replaced_existing,
+        )
+        return result
 
     @classmethod
     def _validate_restore_paths(
@@ -1072,7 +1128,7 @@ class MiniKV:
         raise PersistenceError(msg) from error
 
     @classmethod
-    def restore(
+    def restore(  # noqa: PLR0913 - explicit public restore safety controls.
         cls,
         backup: str | os.PathLike[str],
         destination: str | os.PathLike[str],
@@ -1080,6 +1136,7 @@ class MiniKV:
         overwrite: bool = False,
         max_database_bytes: int = DEFAULT_MAX_DATABASE_BYTES,
         fault_hook: FaultHook | None = None,
+        event_hook: EventHook | None = None,
     ) -> RestoreStats:
         """Validate a backup fully, then atomically restore an inactive path."""
         cls._validate_restore_options(
@@ -1155,18 +1212,35 @@ class MiniKV:
         finally:
             lock.file.close()
 
+        event = operational_event(
+            1,
+            "restore.completed",
+            entries=entries,
+            parent_directory_fsynced=directory_fsynced,
+            payload_bytes=len(payload),
+            replaced_existing=target_identity is not None,
+        )
+        events_dropped = cls._deliver_event(event_hook, event)
         return RestoreStats(
             entries=entries,
             payload_bytes=len(payload),
             payload_sha256=digest,
             replaced_existing=target_identity is not None,
             parent_directory_fsynced=directory_fsynced,
+            events_dropped=events_dropped,
         )
 
     def close(self) -> None:
         """Close the handle. Calling close repeatedly is safe."""
         if self._closed:
             return
+        self._emit_event(
+            "store.closed",
+            entries=len(self._index),
+            events_dropped=self._events_dropped,
+            log_bytes=self._log_bytes,
+            sequence=self._sequence,
+        )
         self._closed = True
         self._file.close()
         if self._lock_file is not None:

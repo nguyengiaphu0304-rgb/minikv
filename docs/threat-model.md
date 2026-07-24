@@ -35,6 +35,10 @@ untrusted.
 - Database and lock-sidecar identities are rechecked before mutation and
   replacement boundaries. Kernel lock release is exercised after abrupt process
   exit.
+- Operational events use exact name/metric allowlists and contain no key, value,
+  path, timestamp, process, host, or exception fields.
+- Synthetic evidence uses generated fixtures and records only counts, byte
+  sizes, durability booleans, and SHA-256 lineage.
 
 ## Out of scope and residual risks
 
@@ -60,6 +64,13 @@ untrusted.
 - Reliable operation requires local POSIX `flock` semantics. Windows, inherited
   post-`fork()` handles, and filesystems with unreliable or host-local advisory
   locks are unsupported.
+- Event hooks run application code synchronously. Their ordinary exceptions are
+  suppressed after being counted so they cannot reverse a durable operation;
+  hooks can still add latency or deliberately terminate the process.
+- Events are not authenticated, durable, ordered across handles, or sufficient
+  for security auditing. Consumers control any external sink and its privacy.
+- Synthetic workload timings can vary with runners, filesystems, contention,
+  caches, and virtualization. They are not evidence of production performance.
 
 Applications needing adversarial integrity, confidentiality, multiple
 simultaneous writers, distributed coordination, or durable remote recovery

@@ -1,0 +1,17 @@
+{
+  "backup_artifact_bytes": 4000,
+  "backup_payload_sha256": "b5335a2c9b6750e79ca0c4236e7757064941e2e722b1b8f479fbe316283a5c01",
+  "compacted_bytes": 3944,
+  "deletes": 8,
+  "event_count": 98,
+  "event_sha256": "913d4e61a1ef8739b25cfd89c88b7b14ef74ec473dd8916a941eeaabb290e2ae",
+  "events_dropped": 0,
+  "fixture_sha256": "67561c8472f8eee7899d7c4671dc84fed4d687dc754dca1e71243d6d233aed46",
+  "frames_before_compaction": 91,
+  "live_entries": 59,
+  "logical_state_sha256": "b13a308770728614d816c015b59a5a2068d39ca6eb4f2600e7fcd714bdfed4e9",
+  "pre_compaction_bytes": 5864,
+  "puts": 83,
+  "schema_version": 1,
+  "workload_id": "minikv-synthetic-v1"
+}

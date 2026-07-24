@@ -56,6 +56,28 @@ rewrite the database. It is not a distributed lease, authentication mechanism,
 or substitute for transaction isolation. Windows and inherited handles after
 `fork()` are outside the verified contract.
 
+## Why are events emitted only after success?
+
+An event named `mutation.put_committed` must correspond to a mutation that
+crossed the write, flush, and `fsync` boundary. Emitting before persistence could
+create a false audit trail. If the callback then fails, MiniKV counts the drop
+but does not report the already-durable operation as failed.
+
+## Why not put timestamps, paths, or exception text in events?
+
+Those fields are common routes for application data and host identity to leak
+into logs. MiniKV's fixed schema provides the operational signals it can defend:
+counts, byte sizes, sequence values, operation categories, and durability
+booleans. Applications can add deployment context outside the storage boundary
+under their own data policy.
+
+## Is the synthetic workload a benchmark?
+
+No. The stable contract is the same operation counts, byte counts, logical-state
+digest, backup digest, and event digest. Durations are recorded separately and
+only checked against generous smoke limits that catch hangs. Claiming throughput
+or latency from one virtualized CI runner would be misleading.
+
 ## How is compaction made reviewable?
 
 Compaction rewrites all live state and replaces the authoritative file. It needs
@@ -92,6 +114,6 @@ hidden behind a "backup complete" message.
 
 ## Highest-risk next change
 
-Performance evidence must be deterministic and must distinguish measured
-educational workloads from production claims. Structured events must remain
-useful without exposing keys, values, paths, or backup contents.
+The release candidate must package reproducible demo evidence without confusing
+archive reproducibility, synthetic workload correctness, or CI smoke timings
+with physical power-loss testing or production readiness.
