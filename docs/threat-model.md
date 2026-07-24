@@ -30,13 +30,19 @@ untrusted.
 - Backup/restore use strict versioned envelopes, bounded lengths, SHA-256,
   ordinary log replay, canonical equality, exclusive temporary files, explicit
   overwrite consent, identity rechecks, and atomic replacement.
+- A persistent owner-only sidecar and non-blocking exclusive POSIX `flock`
+  prevent concurrent opens and restores by cooperating MiniKV processes.
+- Database and lock-sidecar identities are rechecked before mutation and
+  replacement boundaries. Kernel lock release is exercised after abrupt process
+  exit.
 
 ## Out of scope and residual risks
 
 - CRC32 is forgeable; a malicious writer can alter data and recompute it.
 - Source and parent replacement are detected at explicit boundaries, but
   platform-specific time-of-check/time-of-use races are not fully eliminated.
-- No inter-process lock prevents simultaneous writers.
+- Advisory locking cannot stop malicious or non-cooperating writers, and is not
+  a distributed consensus or lease protocol.
 - No encryption at rest, key management, secure deletion, or access-control
   layer is provided.
 - Backup SHA-256 is not a signature or MAC. Anyone able to rewrite an artifact
@@ -51,9 +57,10 @@ untrusted.
 - After atomic replacement but before directory `fsync`, a crash can leave the
   old or new directory entry depending on filesystem semantics. An observed
   failure in that boundary closes the handle and requires reopen.
-- Restoring into a path that another process has open is unsupported. Atomic
-  replacement can leave that process attached to the previous inode.
+- Reliable operation requires local POSIX `flock` semantics. Windows, inherited
+  post-`fork()` handles, and filesystems with unreliable or host-local advisory
+  locks are unsupported.
 
-Applications needing adversarial integrity, confidentiality, multi-writer
-coordination, or durable remote recovery should use a production database and
-appropriate platform controls.
+Applications needing adversarial integrity, confidentiality, multiple
+simultaneous writers, distributed coordination, or durable remote recovery
+should use a production database and appropriate platform controls.

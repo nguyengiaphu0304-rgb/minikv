@@ -17,5 +17,9 @@ class ClosedError(MiniKVError):
     """An operation was attempted after the database was closed."""
 
 
+class ConcurrencyError(MiniKVError):
+    """Another cooperating process owns the database lifetime lock."""
+
+
 class PersistenceError(MiniKVError):
     """A mutation could not be durably persisted and was rolled back."""

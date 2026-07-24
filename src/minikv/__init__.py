@@ -1,6 +1,13 @@
 """Public MiniKV API."""
 
-from minikv.errors import ClosedError, CorruptionError, LimitError, MiniKVError, PersistenceError
+from minikv.errors import (
+    ClosedError,
+    ConcurrencyError,
+    CorruptionError,
+    LimitError,
+    MiniKVError,
+    PersistenceError,
+)
 from minikv.store import (
     BACKUP_MAGIC,
     BACKUP_VERSION,
@@ -27,6 +34,7 @@ __all__ = [
     "BackupStats",
     "ClosedError",
     "CompactionStats",
+    "ConcurrencyError",
     "CorruptionError",
     "LimitError",
     "MiniKV",
