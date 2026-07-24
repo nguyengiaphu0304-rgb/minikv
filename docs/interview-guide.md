@@ -52,8 +52,29 @@ The important honesty boundary is after replacement: if directory `fsync` or
 rebinding fails, the code cannot truthfully claim rollback. It closes the handle,
 reports that replacement occurred, and requires a reopen.
 
+## Why does a backup have both SHA-256 and ordinary log validation?
+
+SHA-256 proves that payload bytes match the envelope, but it does not prove those
+bytes form a valid database. Restore also runs the ordinary scanner, checks
+entry count and completeness, and regenerates the canonical log. This separates
+transport integrity from storage-format correctness.
+
+## Why is overwrite opt-in during restore?
+
+Restore is an administrative operation with a larger blast radius than open or
+put. Requiring `overwrite=True` prevents a typo from silently replacing an
+existing database. Even with consent, the old destination remains untouched
+until the validated temporary payload reaches the atomic replacement boundary.
+
+## Is the backup authenticated or a full disaster-recovery system?
+
+No. SHA-256 detects corruption but a malicious writer can replace the digest.
+The project does not provide signatures, encryption, remote retention,
+replication, or restore orchestration. Those limits are explicit rather than
+hidden behind a "backup complete" message.
+
 ## Highest-risk next change
 
-Backup/restore must define artifact naming, overwrite policy, logical and byte
-integrity evidence, retention assumptions, and recovery behavior without
-confusing a copy with a durable off-device backup.
+Concurrent-open handling needs a clear lock lifetime, stale-handle behavior, and
+independent-process tests. A lock around individual writes would be insufficient
+because each process also maintains a derived in-memory index and sequence.

@@ -5,7 +5,7 @@ and portfolio review. It demonstrates how an append-only log can acknowledge
 mutations only after durability, rebuild deterministic state after restart, and
 distinguish a torn final write from complete corrupt data.
 
-The current `v0.2` engine is intentionally single-process and local. It is
+The current `v0.3` engine is intentionally single-process and local. It is
 not a replacement for SQLite, RocksDB, Redis, or a production database.
 
 ## What it does
@@ -23,6 +23,11 @@ not a replacement for SQLite, RocksDB, Redis, or a production database.
 - Compacts live state into deterministic sorted frames using a private sibling
   file, independent validation, atomic replacement, and parent-directory
   `fsync` where supported.
+- Publishes versioned SHA-256 backup artifacts from canonical live state and
+  restores them only after envelope, digest, log, count, and canonical-form
+  validation.
+- Requires explicit overwrite consent for restore and preserves the prior
+  destination on every handled failure before atomic replacement.
 - Has no production dependencies.
 
 ## Install and verify
@@ -60,7 +65,11 @@ with MiniKV.open(Path("example.mkv")) as store:
     assert store.keys() == ("language",)
     result = store.compact()
     assert result.entries == 1
+    backup = store.backup(Path("example.mkvb"))
+    assert backup.entries == 1
     store.delete("language")
+
+MiniKV.restore("example.mkvb", "restored.mkv")
 ```
 
 Keys are normalized to Unicode NFC. Values are copied on input and returned as
@@ -92,6 +101,25 @@ or rebind step fails, the handle closes and raises `PersistenceError`; the calle
 must reopen and inspect the path because the compacted file may already be
 authoritative. MiniKV never reports such a case as a clean rollback.
 
+## Backup and restore contract
+
+`backup()` wraps the canonical live-state log in a versioned `MKB1` envelope
+containing the log format, entry count, payload length, and SHA-256 digest. It
+writes an owner-only sibling temporary file, flushes and `fsync`s it, reopens
+and verifies the artifact, rechecks path identities, atomically publishes it,
+and requests parent-directory durability.
+
+`MiniKV.restore()` validates the entire artifact before creating a destination
+temporary file. The extracted payload must pass the ordinary MiniKV scanner and
+reconstruct a complete canonical log. Existing destinations require
+`overwrite=True`. Every handled pre-replacement failure preserves the previous
+destination; a post-replacement failure reports uncertainty and requires reopen.
+
+SHA-256 detects accidental modification but is not a publisher signature.
+Retention, access control, encryption, and remote durability remain deployment
+responsibilities. Restore targets must be inactive because MiniKV does not yet
+coordinate concurrent processes.
+
 ## Design documentation
 
 - [Architecture](docs/architecture.md)
@@ -101,14 +129,15 @@ authoritative. MiniKV never reports such a case as a clean rollback.
 - [Interview guide](docs/interview-guide.md)
 - [ADR-001: append-only verified log](docs/adr/001-append-only-verified-log.md)
 - [ADR-002: validated atomic compaction](docs/adr/002-validated-atomic-compaction.md)
+- [ADR-003: canonical backup and atomic restore](docs/adr/003-canonical-backup-restore.md)
 
 ## Current limitations
 
 - One process and one open writer only; there is no file locking.
 - No transactions across multiple keys, compare-and-swap, snapshots, or
   isolation levels.
-- No encryption, authenticated writer, artifact signing, backup policy, or
-  secure deletion.
+- No encryption, authenticated writer, artifact signing, remote retention
+  policy, or secure deletion.
 - Compaction removes obsolete values from the active path but does not guarantee
   secure erasure from storage media, snapshots, or backups.
 - Recovery tests use deterministic fault injection, not physical
@@ -116,6 +145,6 @@ authoritative. MiniKV never reports such a case as a clean rollback.
 - `fsync` semantics still depend on the operating system, filesystem, and
   storage device.
 
-The next milestone adds validated backup/restore and explicit concurrent-open
-handling, followed by repeatable performance/data-quality evidence before a
-`v1.0` release is considered.
+The next milestone adds explicit concurrent-open handling, followed by
+repeatable performance/data-quality evidence before a `v1.0` release is
+considered.

@@ -11,7 +11,7 @@
 ## v0.2 — lifecycle and operational evidence
 
 - [x] Atomic compaction with crash-boundary tests and source-log preservation.
-- [ ] Validated backup/restore with logical-content equality evidence.
+- [x] Validated backup/restore with logical-content equality evidence.
 - [ ] Explicit concurrent-open rejection or inter-process locking contract.
 - [ ] Deterministic performance and data-quality report with budgets.
 - [ ] Structured operational events that do not expose keys or values.

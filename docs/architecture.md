@@ -16,6 +16,11 @@ persistence mechanism.
 6. Compaction derives a canonical log from sorted live keys, writes and validates
    a private sibling file, atomically replaces the source, requests directory
    durability, and rebinds the active handle.
+7. Backup wraps the same canonical log in a strict `MKB1` envelope, then
+   independently verifies and atomically publishes the artifact.
+8. Restore validates the envelope and SHA-256 before writing, runs the extracted
+   payload through the ordinary startup scanner, checks canonical equality, and
+   atomically replaces only an inactive destination.
 
 ```text
 caller
@@ -48,11 +53,17 @@ public validation -> frame encoder -> append / flush / fsync
 - A pre-replacement failure preserves the source. A post-replacement durability
   failure closes the handle and requires explicit reopen because rolling back
   safely can no longer be guaranteed.
+- Backup and restore capture source, destination, and parent identities and
+  recheck them at the final replacement boundary. Temporary collisions are
+  never deleted unless MiniKV created and still owns the same inode.
+- Restore never treats an envelope digest as sufficient validation. The payload
+  must satisfy the binary log, entry-count, completeness, and canonical-order
+  contracts before the destination can change.
 
 ## Deliberate scope
 
 The engine optimizes for a readable storage contract, deterministic tests, and
-explicit failure behavior. It does not claim multi-process coordination or
-database-grade transactional guarantees. Validated backup remains a separate
-milestone because publication and retention introduce different integrity and
-recovery contracts.
+explicit failure behavior. It does not claim multi-process coordination,
+remote backup durability, or database-grade transactional guarantees. Backup
+artifacts provide portable recovery evidence, not retention policy, encryption,
+or authenticated provenance.

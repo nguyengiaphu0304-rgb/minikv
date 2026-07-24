@@ -27,6 +27,9 @@ untrusted.
 - Compaction uses an exclusive owner-only sibling file, validates reconstructed
   state before replacement, rechecks source/parent identities, and never deletes
   a colliding path it did not create.
+- Backup/restore use strict versioned envelopes, bounded lengths, SHA-256,
+  ordinary log replay, canonical equality, exclusive temporary files, explicit
+  overwrite consent, identity rechecks, and atomic replacement.
 
 ## Out of scope and residual risks
 
@@ -36,6 +39,10 @@ untrusted.
 - No inter-process lock prevents simultaneous writers.
 - No encryption at rest, key management, secure deletion, or access-control
   layer is provided.
+- Backup SHA-256 is not a signature or MAC. Anyone able to rewrite an artifact
+  can replace both its payload and digest.
+- Local backup publication does not provide remote replication, retention,
+  media independence, rollback protection, or disaster-recovery policy.
 - Compaction removes deleted and overwritten values from the active file, but
   storage media, snapshots, backups, or forensic recovery may retain them.
 - Denial of service remains possible within configured size limits.
@@ -44,6 +51,8 @@ untrusted.
 - After atomic replacement but before directory `fsync`, a crash can leave the
   old or new directory entry depending on filesystem semantics. An observed
   failure in that boundary closes the handle and requires reopen.
+- Restoring into a path that another process has open is unsupported. Atomic
+  replacement can leave that process attached to the previous inode.
 
 Applications needing adversarial integrity, confidentiality, multi-writer
 coordination, or durable remote recovery should use a production database and

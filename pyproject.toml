@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "minikv-store"
-version = "0.2.0"
+version = "0.3.0"
 description = "A bounded, crash-aware append-only key-value storage engine"
 readme = "README.md"
 requires-python = ">=3.11"
